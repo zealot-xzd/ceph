@@ -241,6 +241,10 @@ public:
   friend class C_Deleg_Timeout; // Asserts on client_lock, called when a delegation is unreturned
   friend class C_Client_CacheRelease; // Asserts on client_lock
   friend class SyntheticClient;
+  friend class Client_Read_Finisher;
+  friend class Client_Read_Async_Finisher;
+  friend class Client_Write_Finisher;
+  friend class Client_Read_Sync_Async;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
   template <typename T> friend class RWRef;
@@ -1222,6 +1226,207 @@ protected:
   struct initialize_state_t initialize_state;
 
 private:
+  class C_Read_Finisher : public Context {
+  public:
+    bool iofinished;
+    void finish_io(int r);
+    void finish_onuninline(int r);
+
+    C_Read_Finisher(Client *clnt, Context *onfinish, Context *onuninline,
+                    Context *iofinish, bool is_read_async, int have,
+                    bool movepos, utime_t start, Fh *f, Inode *in,
+                    uint64_t fpos, int64_t offset, uint64_t size)
+      : clnt(clnt), onfinish(onfinish), onuninline(onuninline),
+        iofinish(iofinish), is_read_async(is_read_async), have(have),
+        f(f), in(in), start(start), fpos(fpos), offset(offset),
+        size(size), movepos(movepos) {
+      iofinished_r = 0;
+      onuninlinefinished_r = 0;
+      iofinished = false;
+      onuninlinefinished = onuninline == nullptr;
+    }
+
+    void finish(int r) override {
+      //
+      delete this;
+    }
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    Context *onuninline;
+    Context *iofinish;
+    bool is_read_async;
+    int have;
+    Fh *f;
+    Inode *in;
+    utime_t start;
+    uint64_t fpos;
+    int64_t offset;
+    uint64_t size;
+    int64_t iofinished_r;
+    int64_t onuninlinefinished_r;
+    bool onuninlinefinished;
+    bool movepos;
+    bool try_complete();
+  };
+
+  struct CRF_onuninline : public Context {
+    Client::C_Read_Finisher *CRF;
+
+    CRF_onuninline()
+      : CRF(nullptr) {}
+
+    void finish(int r) override {
+      CRF->finish_onuninline(r);
+      complete(r);
+    }
+  };
+
+  struct CRF_iofinish : public Context {
+    Client::C_Read_Finisher *CRF;
+
+    CRF_iofinish()
+      : CRF(nullptr) {}
+
+    void finish(int r) override {
+      CRF->finish_io(r);
+    }
+
+    // For _read_async, we may not finish in one go, so be prepared for multiple
+    // calls to complete. All the handling though is in C_Read_Finisher.
+    void complete(int r) override {
+      finish(r);
+      if (CRF->iofinished)
+        delete this;
+    }
+  };
+
+  class C_Read_Sync_Async : public Context {
+  public:
+    C_Read_Sync_Async(Client *clnt, Context *onfinish, Fh *f, Inode *in,
+                      uint64_t fpos, uint64_t off, uint64_t len,
+                      bufferlist *bl, Filer *filer, int have)
+      : clnt(clnt), onfinish(onfinish), f(f), in(in), off(off), len(len), bl(bl),
+        filer(filer), have(have)
+    {
+      left = len;
+      wanted = len;
+      read = 0;
+      pos = off;
+      fini = false;
+    }
+
+    void retry();
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    Fh *f;
+    Inode *in;
+    uint64_t off;
+    uint64_t len;
+    int left;
+    int wanted;
+    bufferlist *bl;
+    bufferlist tbl;
+    Filer *filer;
+    int have;
+    int read;
+    uint64_t pos;
+    bool fini;
+
+    void finish(int r) override;
+
+    void complete(int r) override
+    {
+      finish(r);
+      if (fini)
+        delete this;
+    }
+  };
+
+  class C_Read_Async_Finisher : public Context {
+  public:
+    C_Read_Async_Finisher(Client *clnt, Context *onfinish, Fh *f, Inode *in,
+                          uint64_t fpos, uint64_t off, uint64_t len)
+      : clnt(clnt), onfinish(onfinish), f(f), in(in), off(off), len(len) {}
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    Fh *f;
+    Inode *in;
+    uint64_t off;
+    uint64_t len;
+
+    void finish(int r) override;
+  };
+
+  class C_Write_Finisher : public Context {
+  public:
+    void finish_io(int r);
+    void finish_onuninline(int r);
+
+    C_Write_Finisher(Client *clnt, Context *onfinish, Context *onuninline,
+                     Context *iofinish, bool is_file_write,
+                     utime_t start, Fh *f, Inode *in, uint64_t fpos,
+                     int64_t offset, uint64_t size)
+      : clnt(clnt), onfinish(onfinish), onuninline(onuninline),
+        iofinish(iofinish), is_file_write(is_file_write),
+        start(start), f(f), in(in), fpos(fpos), offset(offset), size(size) {
+      iofinished_r = 0;
+      onuninlinefinished_r = 0;
+      iofinished = false;
+      onuninlinefinished = onuninline == nullptr;
+    }
+
+    void finish(int r) override {
+      //
+      delete this;
+    }
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    Context *onuninline;
+    Context *iofinish;
+    bool is_file_write;
+    utime_t start;
+    Fh *f;
+    Inode *in;
+    uint64_t fpos;
+    int64_t offset;
+    uint64_t size;
+    int64_t iofinished_r;
+    int64_t onuninlinefinished_r;
+    bool iofinished;
+    bool onuninlinefinished;
+    bool try_complete();
+  };
+
+  struct CWF_onuninline : public Context {
+    C_Write_Finisher *CWF;
+
+    CWF_onuninline()
+      : CWF(nullptr) {}
+
+    void finish(int r) override {
+      CWF->finish_onuninline(r);
+    }
+  };
+
+  struct CWF_iofinish : public Context {
+    C_Write_Finisher *CWF;
+
+    CWF_iofinish()
+      : CWF(nullptr) {}
+
+    void finish(int r) override {
+      CWF->finish_io(r);
+    }
+  };
+
   struct C_Readahead : public Context {
     C_Readahead(Client *c, Fh *f);
     ~C_Readahead() override;

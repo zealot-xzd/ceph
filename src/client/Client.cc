@@ -9823,6 +9823,162 @@ int Client::preadv(int fd, const struct iovec *iov, int iovcnt, loff_t offset)
   return _preadv_pwritev(fd, iov, iovcnt, offset, false);
 }
 
+void Client::C_Read_Finisher::finish_io(int r)
+{
+  bool fini;
+  utime_t lat;
+
+  // Caller holds client_lock so we don't need to take it.
+
+  if (r >= 0) {
+    if (is_read_async) {
+    } else {
+      // may need to retry on short read
+    }
+
+    ceph_assert(r >= 0);
+    if (movepos) {
+      // adjust fd pos
+      f->pos = offset + r;
+    }
+    
+    lat = ceph_clock_now();
+    lat -= start;
+    clnt->logger->tinc(l_c_read, lat);
+  }
+
+  iofinished = true;
+  iofinished_r = r;
+  fini = try_complete();
+
+  if (fini)
+    delete this;
+}
+
+void Client::C_Read_Finisher::finish_onuninline(int r)
+{
+  bool fini;
+
+  clnt->client_lock.lock();
+
+  if (r >= 0 || r == -CEPHFS_ECANCELED) {
+    in->inline_data.clear();
+    in->inline_version = CEPH_INLINE_NONE;
+    in->mark_caps_dirty(CEPH_CAP_FILE_WR);
+    clnt->check_caps(in, 0);
+  }
+
+  onuninlinefinished = true;
+  onuninlinefinished_r = r;
+  fini = try_complete();
+
+  clnt->client_lock.unlock();
+
+  if (fini)
+    delete this;
+}
+
+bool Client::C_Read_Finisher::try_complete()
+{
+  if (onuninlinefinished && iofinished) {
+    if (have) {
+      clnt->put_cap_ref(in, CEPH_CAP_FILE_RD);
+    }
+    if (movepos) {
+      clnt->unlock_fh_pos(f);
+    }
+
+    if (onuninlinefinished_r >= 0 || onuninlinefinished_r == -CEPHFS_ECANCELED)
+      onfinish->complete(iofinished_r);
+    else
+      onfinish->complete(onuninlinefinished_r);
+    return true;
+  }
+  return false;
+}
+
+void Client::C_Read_Sync_Async::retry()
+{
+  filer->read_trunc(in->ino, &in->layout, in->snapid, pos, left, &tbl, 0,
+                    in->truncate_size, in->truncate_seq, this);
+}
+
+void Client::C_Read_Sync_Async::finish(int r)
+{
+  clnt->client_lock.lock();
+
+  if (r == -CEPHFS_ENOENT) {
+    // if we get ENOENT from OSD, assume 0 bytes returned
+    goto success;
+  } else if (r < 0) {
+    // pass error to caller
+    goto error;
+  }
+
+  if (tbl.length()) {
+    r = tbl.length();
+
+    read += r;
+    pos += r;
+    left -= r;
+    bl->claim_append(tbl);
+  }
+
+  // short read?
+  if (r >= 0 && r < wanted) {
+    if (pos < in->size) {
+      // zero up to known EOF
+      int64_t some = in->size - pos;
+      if (some > left)
+        some = left;
+      auto z = buffer::ptr_node::create(some);
+      z->zero();
+      bl->push_back(std::move(z));
+      read += some;
+      pos += some;
+      left -= some;
+      if (left == 0)
+        goto success;
+    }
+
+    clnt->put_cap_ref(in, CEPH_CAP_FILE_RD);
+    // reverify size
+    {
+      r = clnt->_getattr(in, CEPH_STAT_CAP_SIZE, f->actor_perms);
+      if (r < 0)
+        goto error;
+    }
+
+    // eof?  short read.
+    if ((uint64_t)pos >= in->size)
+      goto success;
+
+    {
+      int have2 = 0;
+      r = clnt->get_caps(f, CEPH_CAP_FILE_RD, have, &have2, -1);
+      if (r < 0) {
+        goto error;
+      }
+    }
+
+    wanted = left;
+    retry();
+    clnt->client_lock.unlock();
+    return;
+  }
+
+success:
+
+  r = read;
+
+error:
+
+  onfinish->complete(r);
+  fini = true;
+
+  clnt->client_lock.unlock();
+}
+
 int64_t Client::_read(Fh *f, int64_t offset, uint64_t size, bufferlist *bl)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -10013,6 +10169,17 @@ void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
       }
     }
   }
+}
+
+void Client::C_Read_Async_Finisher::finish(int r)
+{
+  clnt->client_lock.lock();
+
+  clnt->do_readahead(f, in, off, len);
+
+  onfinish->complete(r);
+
+  clnt->client_lock.unlock();
 }
 
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl)
@@ -10262,6 +10429,67 @@ int64_t Client::_write_success(Fh *f, utime_t start, uint64_t fpos,
   in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
   return r;
+}
+
+void Client::C_Write_Finisher::finish_io(int r)
+{
+  bool fini;
+
+  clnt->put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+
+  if (r >= 0) {
+    if (is_file_write) {
+      if ((f->flags & O_SYNC) || (f->flags & O_DSYNC)) {
+        clnt->_flush_range(in, offset, size);
+      }
+    }
+
+    r = clnt->_write_success(f, start, fpos, offset, size, in);
+  }
+
+  iofinished = true;
+  iofinished_r = r;
+  fini = try_complete();
+
+  if (fini)
+    delete this;
+}
+
+void Client::C_Write_Finisher::finish_onuninline(int r)
+{
+  bool fini;
+
+  clnt->client_lock.lock();
+
+  if (r >= 0 || r == -CEPHFS_ECANCELED) {
+    in->inline_data.clear();
+    in->inline_version = CEPH_INLINE_NONE;
+    in->mark_caps_dirty(CEPH_CAP_FILE_WR);
+    clnt->check_caps(in, 0);
+  }
+
+  onuninlinefinished = true;
+  onuninlinefinished_r = r;
+  fini = try_complete();
+
+  clnt->client_lock.unlock();
+
+  if (fini)
+    delete this;
+}
+
+bool Client::C_Write_Finisher::try_complete()
+{
+  if (onuninlinefinished && iofinished) {
+    clnt->put_cap_ref(in, CEPH_CAP_FILE_WR);
+
+    if (onuninlinefinished_r >= 0 || onuninlinefinished_r == -CEPHFS_ECANCELED)
+      onfinish->complete(iofinished_r);
+    else
+      onfinish->complete(onuninlinefinished_r);
+    return true;
+  }
+  return false;
 }
 
 int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
