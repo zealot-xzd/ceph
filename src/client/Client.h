@@ -1498,7 +1498,8 @@ private:
   int _do_remount(bool retry_on_error);
 
   int _read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl, bool *checkeof);
-  int _read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl);
+  int _read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
+                  Context *onfinish);
 
   bool _dentry_valid(const Dentry *dn);
 
@@ -1562,17 +1563,21 @@ private:
               std::string alternate_name);
 
   loff_t _lseek(Fh *fh, loff_t offset, int whence);
-  int64_t _read(Fh *fh, int64_t offset, uint64_t size, bufferlist *bl);
+  int64_t _read(Fh *fh, int64_t offset, uint64_t size, bufferlist *bl,
+  		Context *onfinish = nullptr);
   void do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len);
   int64_t _write_success(Fh *fh, utime_t start, uint64_t fpos,
           int64_t offset, uint64_t size, Inode *in);
   int64_t _write(Fh *fh, int64_t offset, uint64_t size, const char *buf,
-          const struct iovec *iov, int iovcnt);
+          const struct iovec *iov, int iovcnt, Context *onfinish = nullptr);
   int64_t _preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                  unsigned iovcnt, int64_t offset,
-                                 bool write, bool clamp_to_int);
+                                 bool write, bool clamp_to_int,
+                                 Context *onfinish = nullptr,
+                                 bufferlist *blp = nullptr);
   int _preadv_pwritev(int fd, const struct iovec *iov, unsigned iovcnt,
-                      int64_t offset, bool write);
+                      int64_t offset, bool write, Context *onfinish = nullptr,
+                      bufferlist *blp = nullptr);
   int _flush(Fh *fh);
   int _fsync(Fh *fh, bool syncdataonly);
   int _fsync(Inode *in, bool syncdataonly);

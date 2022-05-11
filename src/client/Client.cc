@@ -9979,18 +9979,24 @@ error:
   clnt->client_lock.unlock();
 }
 
-int64_t Client::_read(Fh *f, int64_t offset, uint64_t size, bufferlist *bl)
+int64_t Client::_read(Fh *f, int64_t offset, uint64_t size, bufferlist *bl,
+                      Context *onfinish)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
   int want, have = 0;
   bool movepos = false;
-  std::unique_ptr<C_SaferCond> onuninline;
+  std::unique_ptr<Context> onuninline;
+  std::unique_ptr<Context> iofinish = nullptr;
+  std::unique_ptr<C_Read_Finisher> crf = nullptr;
   int64_t rc = 0;
   const auto& conf = cct->_conf;
   Inode *in = f->inode.get();
   utime_t lat;
   utime_t start = ceph_clock_now(); 
+  CRF_onuninline *crf_onuninline = NULL;
+  CRF_iofinish *crf_iofinish = NULL;
+  C_SaferCond *cond_onuninline = NULL;
 
   if ((f->mode & CEPH_FILE_MODE_RD) == 0)
     return -CEPHFS_EBADF;
@@ -10029,7 +10035,13 @@ retry:
 
   if (in->inline_version < CEPH_INLINE_NONE) {
     if (!(have & CEPH_CAP_FILE_CACHE)) {
-      onuninline.reset(new C_SaferCond("Client::_read_uninline_data flock"));
+      if (onfinish) {
+        crf_onuninline = new CRF_onuninline();
+        onuninline.reset(crf_onuninline);
+      } else {
+        cond_onuninline = new C_SaferCond("Client::_read_uninline_data flock"); 
+        onuninline.reset(cond_onuninline);
+      }
       uninline_data(in, onuninline.get());
     } else {
       uint32_t len = in->inline_data.length();
@@ -10055,6 +10067,23 @@ retry:
     }
   }
 
+  if (onfinish) {
+     crf_iofinish = new CRF_iofinish();
+     iofinish.reset(crf_iofinish);
+
+     crf.reset(new
+       C_Read_Finisher(this, onfinish, crf_onuninline, iofinish.get(),
+                       !conf->client_debug_force_sync_read &&
+                         conf->client_oc &&
+                         (have & (CEPH_CAP_FILE_CACHE |
+                                  CEPH_CAP_FILE_LAZYIO)),
+                       have, movepos, start, f, in, f->pos, offset, size));
+
+    if (crf_onuninline != NULL)
+      crf_onuninline->CRF = crf.get();
+    crf_iofinish->CRF = crf.get();
+  }
+
   if (!conf->client_debug_force_sync_read &&
       conf->client_oc &&
       (have & (CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO))) {
@@ -10062,9 +10091,39 @@ retry:
     if (f->flags & O_RSYNC) {
       _flush_range(in, offset, size);
     }
-    rc = _read_async(f, offset, size, bl);
+    rc = _read_async(f, offset, size, bl, iofinish.get());
+
+    if (onfinish) {
+      // handle async caller (onfinish != nullptr), we can now safely release
+      // all the managed pointers, but we might need to do something with
+      // iofinisher.
+      Context *iof = iofinish.release();
+      onuninline.release();
+      crf.release();
+
+      if (rc < 0)
+        iof->complete(rc);
+
+      // allow caller to wait on onfinish...
+      return 0;
+    }
+
     if (rc < 0)
       goto done;
+  } else if (onfinish) {
+    // handle _sync_read asynchronously...
+    C_Read_Sync_Async *crsa =
+      new C_Read_Sync_Async(this, iofinish.release(), f, in, f->pos,
+                            offset, size, bl, filer.get(), have);
+      onuninline.release();
+      crf.release();
+
+      // Now make first attempt at performing _read_sync
+      crsa->retry();
+
+      // Now the C_Read_Sync_Async is going to handle EVERYTHING else
+      // Allow caller to wait on onfinish...
+      return 0;
   } else {
     if (f->flags & O_DIRECT)
       _flush_range(in, offset, size);
@@ -10109,9 +10168,9 @@ success:
 done:
   // done!
   
-  if (onuninline) {
+  if (cond_onuninline != nullptr) {
     client_lock.unlock();
-    int ret = onuninline->wait();
+    int ret = cond_onuninline->wait();
     client_lock.lock();
     if (ret >= 0 || ret == -CEPHFS_ECANCELED) {
       in->inline_data.clear();
@@ -10182,7 +10241,8 @@ void Client::C_Read_Async_Finisher::finish(int r)
   clnt->client_lock.unlock();
 }
 
-int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl)
+int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
+			Context *onfinish)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
@@ -10206,13 +10266,40 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl)
 
   // read (and possibly block)
   int r = 0;
-  C_SaferCond onfinish("Client::_read_async flock");
+  std::unique_ptr<Context> io_finish = nullptr;
+  C_SaferCond *io_finish_cond = nullptr;
+  if (onfinish == nullptr) {
+    io_finish_cond = new C_SaferCond("Client::_read_async flock");
+    io_finish.reset(io_finish_cond);
+  } else {
+    io_finish.reset(new C_Read_Async_Finisher(this, onfinish, f, in,
+                                              f->pos, off, len));
+  }
+
   r = objectcacher->file_read(&in->oset, &in->layout, in->snapid,
-			      off, len, bl, 0, &onfinish);
+			      off, len, bl, 0, io_finish.get());
+
+  if (onfinish != nullptr) {
+    // Release C_Read_Async_Finisher from managed pointer, either
+    // file_read will result in async complete, or we need to complete
+    // immediately. In either case, the C_Read_Async_Finisher is safely
+    // handled and won't be abandoned.
+    Context *crf = io_finish.release();
+    if (r != 0) {
+      // need to do readahead, so complete the crf
+      client_lock.unlock();
+      crf->complete(r);
+      client_lock.lock();
+    } else {
+      get_cap_ref(in, CEPH_CAP_FILE_CACHE);
+    }
+    return 0;
+  }
+
   if (r == 0) {
     get_cap_ref(in, CEPH_CAP_FILE_CACHE);
     client_lock.unlock();
-    r = onfinish.wait();
+    r = io_finish_cond->wait();
     client_lock.lock();
     put_cap_ref(in, CEPH_CAP_FILE_CACHE);
     update_read_io_size(bl->length());
@@ -10331,7 +10418,8 @@ int Client::pwritev(int fd, const struct iovec *iov, int iovcnt, int64_t offset)
 
 int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                        unsigned iovcnt, int64_t offset,
-                                       bool write, bool clamp_to_int)
+                                       bool write, bool clamp_to_int,
+                                       Context *onfinish, bufferlist *blp)
 {
     ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
@@ -10352,16 +10440,24 @@ int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
     if (clamp_to_int) {
       totallen = std::min(totallen, (loff_t)INT_MAX);
     }
+
     if (write) {
-        int64_t w = _write(fh, offset, totallen, NULL, iov, iovcnt);
+        int64_t w = _write(fh, offset, totallen, NULL, iov, iovcnt, onfinish);
         ldout(cct, 3) << "pwritev(" << fh << ", \"...\", " << totallen << ", " << offset << ") = " << w << dendl;
         return w;
     } else {
         bufferlist bl;
-        int64_t r = _read(fh, offset, totallen, &bl);
+        int64_t r = _read(fh, offset, totallen, blp ? blp : &bl,
+                          onfinish);
         ldout(cct, 3) << "preadv(" << fh << ", " <<  offset << ") = " << r << dendl;
-        if (r <= 0)
+        if (r <= 0) {
+          if (r < 0 && onfinish != nullptr) {
+            client_lock.unlock();
+            onfinish->complete(r);
+            client_lock.lock();
+          }
           return r;
+        }
 
         client_lock.unlock();
         copy_bufferlist_to_iovec(iov, iovcnt, &bl, r);
@@ -10370,7 +10466,9 @@ int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
     }
 }
 
-int Client::_preadv_pwritev(int fd, const struct iovec *iov, unsigned iovcnt, int64_t offset, bool write)
+int Client::_preadv_pwritev(int fd, const struct iovec *iov, unsigned iovcnt,
+                            int64_t offset, bool write, Context *onfinish,
+                            bufferlist *blp)
 {
     RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
     if (!mref_reader.is_state_satisfied())
@@ -10383,7 +10481,8 @@ int Client::_preadv_pwritev(int fd, const struct iovec *iov, unsigned iovcnt, in
     Fh *fh = get_filehandle(fd);
     if (!fh)
       return -CEPHFS_EBADF;
-    return _preadv_pwritev_locked(fh, iov, iovcnt, offset, write, true);
+    return _preadv_pwritev_locked(fh, iov, iovcnt, offset, write, true,
+                                  onfinish, blp);
 }
 
 int64_t Client::_write_success(Fh *f, utime_t start, uint64_t fpos,
@@ -10493,11 +10592,15 @@ bool Client::C_Write_Finisher::try_complete()
 }
 
 int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
-	                const struct iovec *iov, int iovcnt)
+	                const struct iovec *iov, int iovcnt, Context *onfinish)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
   uint64_t fpos = 0;
+  CWF_onuninline *cwf_onuninline = NULL;
+  CWF_iofinish *cwf_iofinish = NULL;
+  C_SaferCond *cond_onuninline = NULL;
+  C_SaferCond *cond_iofinish = NULL;
 
   if ((uint64_t)(offset+size) > mdsmap->get_max_filesize()) //too large!
     return -CEPHFS_EFBIG;
@@ -10594,13 +10697,21 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 
   ldout(cct, 10) << " snaprealm " << *in->snaprealm << dendl;
 
-  std::unique_ptr<C_SaferCond> onuninline = nullptr;
+  std::unique_ptr<Context> onuninline = nullptr;
+  std::unique_ptr<Context> iofinish = nullptr;
+  std::unique_ptr<C_Write_Finisher> cwf = nullptr;
   
   if (in->inline_version < CEPH_INLINE_NONE) {
     if (endoff > cct->_conf->client_max_inline_size ||
         endoff > CEPH_INLINE_MAX_SIZE ||
         !(have & CEPH_CAP_FILE_BUFFER)) {
-      onuninline.reset(new C_SaferCond("Client::_write_uninline_data flock"));
+      if (onfinish) {
+        cwf_onuninline = new CWF_onuninline();
+        onuninline.reset(cwf_onuninline);
+      } else {
+        cond_onuninline = new C_SaferCond("Client::_write_uninline_data flock");
+        onuninline.reset(cond_onuninline);
+      }
       uninline_data(in, onuninline.get());
     } else {
       get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
@@ -10624,6 +10735,22 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     }
   }
 
+  if (onfinish) {
+     cwf_iofinish = new CWF_iofinish();
+     iofinish.reset(cwf_iofinish);
+
+     cwf.reset(new
+       C_Write_Finisher(this, onfinish, onuninline.get(), iofinish.get(),
+                        cct->_conf->client_oc &&
+                          (have & (CEPH_CAP_FILE_BUFFER |
+                                 CEPH_CAP_FILE_LAZYIO)),
+                        start, f, in, fpos, offset, size));
+
+    if (cwf_onuninline != NULL)
+      cwf_onuninline->CWF = cwf.get();
+    cwf_iofinish->CWF = cwf.get();
+  }
+
   if (cct->_conf->client_oc &&
       (have & (CEPH_CAP_FILE_BUFFER | CEPH_CAP_FILE_LAZYIO))) {
     // do buffered write
@@ -10636,7 +10763,25 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     r = objectcacher->file_write(&in->oset, &in->layout,
 				 in->snaprealm->get_snap_context(),
 				 offset, size, bl, ceph::real_clock::now(),
-				 0);
+				 0, iofinish.get(), onfinish == nullptr);
+
+    if (onfinish) {
+      // handle async caller (onfinish != nullptr), we can now safely release
+      // all the managed pointers, but we might need to do something with
+      // iofinisher.
+      Context *iof = iofinish.release();
+      onuninline.release();
+      cwf.release();
+
+      if (r < 0) {
+        // should not get here, but...
+        iof->complete(r);
+      }
+
+      // allow caller to wait on onfinish...
+      return 0;
+    }
+
     put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
     if (r < 0)
@@ -10653,15 +10798,32 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
       _flush_range(in, offset, size);
 
     // simple, non-atomic sync write
-    C_SaferCond onfinish("Client::_write flock");
+    if (onfinish == nullptr) {
+      // We need a safer condition to wait on.
+      cond_iofinish = new C_SaferCond();
+      iofinish.reset(cond_iofinish);
+    }
+
     get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
     filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
 		       offset, size, bl, ceph::real_clock::now(), 0,
 		       in->truncate_size, in->truncate_seq,
-		       &onfinish);
+		       iofinish.get());
+
+    if (onfinish) {
+      // handle async caller (onfinish != nullptr), we can now safely release
+      // all the managed pointers
+      iofinish.release();
+      onuninline.release();
+      cwf.release();
+
+      // allow caller to wait on onfinish...
+      return 0;
+    }
+
     client_lock.unlock();
-    r = onfinish.wait();
+    r = cond_iofinish->wait();
     client_lock.lock();
     put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
     if (r < 0)
@@ -10671,13 +10833,16 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
   // if we get here, write was successful, update client metadata
 success:
 
+  // do not get here if async caller (onfinish != nullptr)
   r = _write_success(f, start, fpos, offset, size, in);
 
 done:
 
-  if (nullptr != onuninline) {
+  // can not get here if async caller (onfinish != nullptr)
+
+  if (nullptr != cond_onuninline) {
     client_lock.unlock();
-    int uninline_ret = onuninline->wait();
+    int uninline_ret = cond_onuninline->wait();
     client_lock.lock();
 
     if (uninline_ret >= 0 || uninline_ret == -CEPHFS_ECANCELED) {
