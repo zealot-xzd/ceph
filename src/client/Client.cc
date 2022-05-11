@@ -9738,6 +9738,7 @@ void Client::unlock_fh_pos(Fh *f)
 int Client::uninline_data(Inode *in, Context *onfinish)
 {
   if (!in->inline_data.length()) {
+    // TODO - should we drop the client_lock here?
     onfinish->complete(0);
     return 0;
   }
